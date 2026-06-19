@@ -1,0 +1,19 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Сетевой анализ дискурса постгуманистической философии"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Главная
+      - href: code.qmd
+        text: Код
+
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    lang: ru

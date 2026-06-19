@@ -1,0 +1,298 @@
+---
+title: "Исходный код проекта"
+author: "Нискин Е. А."
+date: 2026-06-19
+format:
+  html:
+    toc: true
+    theme: flatly
+    lang: ru
+---
+
+На этой странице собран весь код проекта, разбитый по шагам. Текстовые
+комментарии к каждому шагу и общие выводы находятся во вкладке
+**[Главная](index.qmd)**.
+
+## Шаг 1. Импорт библиотек
+
+```python
+import pymupdf # основная библиотека PyMuPDF для работы с PDF-файлами
+
+import os # путь к файлам
+import re # регулярные выражения
+
+import pandas as pd # табличные данные
+import networkx as nx # графы
+from pyvis.network import Network # визуализация графов в HTML
+import matplotlib.pyplot as plt # визуализация
+```
+
+## Шаг 2. Составление словаря авторов
+
+```python
+folder = "project_posthumanism"
+
+AUTHORS = {
+    "latour": "Б. Латур",
+    "stiegler": "Б. Стиглер",
+    "colebrook": "К. Колбрук",
+    "wolfe": "К. Вулф",
+    "haraway": "Д. Харауэй",
+    "thacker": "Ю. Такер",
+    "ferrando": "Ф. Феррандо",
+    "deleuze": "Ж. Делёз",
+    "harman": "Г. Харман",
+    "simondon": "Ж. Симондон",
+    "grant": "И.Г. Грант",
+    "bennett": "Дж. Беннетт",
+    "barad": "К. Барад",
+    "delanda": "М. ДеЛанда",
+    "heidegger": "М. Хайдеггер",
+    "hayles": "Н. Кэтрин Хейлс",
+    "land": "Н. Ланд",
+    "meillassoux": "К. Мейясу",
+    "braidotti": "Р. Брайдотти",
+    "brassier": "Р. Брассье",
+    "negarestani": "Р. Негарестани",
+    "ligotti": "Т. Лиготти",
+    "morton": "Т. Мортон",
+}
+```
+
+## Шаг 3. Парсинг имени файла
+
+```python
+def parse_filename(a):
+    # Отделяем .pdf в названии
+    name = a.rsplit(".", 1)[0]
+
+    # Отделяем год, если он есть в скобках 
+    match = re.search(r"\((\d{4})\)\s*$", name)
+    if match:
+        # Ищем число из 4-х цифр, затем убираем его вместе со скобками из name
+        year = match.group(1)
+        name = name.replace(match.group(0), "").strip()
+    else:
+        year = None
+
+    # Делим автора и название работы
+    if " - " in name:
+        authorname, title = name.split(" - ", 1)
+    else:
+        authorname, title = name, ""
+
+    # Убираем пробелы, делим имя на слова, достаём последнее, приводим в нижний регистр — получаем фамилию
+    surname = authorname.strip().split()[-1].lower()
+    return surname, title.strip(), year
+```
+
+## Шаг 4. Функции для поиска цитирований
+
+```python
+# Список возможных названий библиографического раздела
+BIB_HEADERS = ["bibliography", "references", "reference notes", "works cited", "notes", "literature"]
+
+# 1) Склеиваем все страницы PDF в одну строку
+def extract_text(path):
+    doc = fitz.open(path) # как раз тут помогает PyMuPDF: он открывает PDF-файл и добавляет в doc весь текст
+    pages_text = []
+    for page in doc:
+        pages_text.append(page.get_text())
+    doc.close()
+    # Раскидываем по слову на строчку
+    full_text = "\n".join(pages_text)
+    return full_text
+
+# 2) Находим начало раздела библиографии и возвращаем текст от него до конца вместе с заголовком. Если ни того, ни другого нет — None.
+# P.S. Мы не обойдёмся без доп. проверки названий библиографий. В некоторых текстах из датасета они пишутся как "B I B L I O G R A P H Y" 
+# или "N O T E S", поэтому просто strip() здесь недостаточно. Будем очищать пробелы внутри каждого слова и проверять совпадение с BIB_HEADERS.
+def get_bibliography(text):
+    lines = text.split("\n")
+    n = len(lines)
+    for header in BIB_HEADERS:
+        # Идём с конца книги, чтобы не попасться на ложные совпадения внутри текста
+        for i in range(n - 1, -1, -1): 
+            if re.sub(r"\s+", "", lines[i].lower()) == re.sub(r"\s+", "", header):
+                # Считаем кол-во строк до начала библиографии (len(l) + 1 — длина слова + очищенный "\n"); выводим текст после start и название раздела
+                start = sum(len(l) + 1 for l in lines[:i])
+                return text[start:], header
+    return None, None
+
+# 3) Собираем всех авторов из списка AUTHORS в библиографическом разделе
+TRICKY = {
+    "grant": r"(?m)^\s*grant,",
+    "land":  r"(?m)^\s*land,",
+}
+
+def find_quotes(text):
+    low_text = text.lower()
+    words = re.findall(r"\w+", low_text)
+    word_set = set(words)
+    found_names = set()
+    for surname, russianname in AUTHORS.items():
+        if surname in TRICKY:
+            if re.search(TRICKY[surname], low_text):
+                found_names.add(russianname)
+        else:
+            if surname in word_set:
+                found_names.add(russianname)
+    return found_names
+```
+
+## Шаг 5. Обработка файлов
+
+```python
+# Создаём три списка: rows для таблицы с данными, failed_files для тех, что не получилось склеить; missing_texts для тех, где нет библиографии
+rows, missing_texts, failed_files = [], [], []
+
+# Смотрим, какой текст обрабатывается в данный момент; начинаем нумерацию с 1
+for i, filename in enumerate(sorted(os.listdir(FOLDER)), 1):
+    print(f"[{i}] В обработке: {filename}")
+    path = os.path.join(FOLDER, filename)
+    
+    # Фамилия, название книги и год нужны для таблицы
+    source, title, year = parse_filename(filename)
+    # Но мы сразу меняем фамилию на русское имя для красоты
+    source_name = AUTHORS[source]
+    
+    # Пробуем, что склеивание текста работает; если нет — добавляем в список failed_files
+    try:
+        text = extract_text(path)
+    except Exception as e:
+        print(f"Пропущен — ошибка чтения: {e}")
+        failed_files.append((filename, str(e)))
+        continue
+
+    # Далее ищем библиографические разделы и их заголовки; если их тоже нет — добавляем текст в список missing_texts
+    biblio_text, header = get_bibliography(text)
+    if biblio_text is None:
+        missing_texts.append(filename)
+        continue
+
+    # Собираем имена тех, кого автор процитировал
+    cited = find_quotes(biblio_text)
+    # Убираем самоцитирование
+    if source_name in cited:
+        cited.remove(source_name)
+
+    # Собираем список словарей для таблицы
+    for i in cited:
+        rows.append({
+            "Автор": source_name,
+            "Название": title,
+            "Год": year,
+            "Кого цитировал": i,
+            "Название раздела": header,
+        })
+
+df = pd.DataFrame(rows)
+print(f"\nРёбер: {len(df)}")
+print(f"Файлов без библиографии: {len(missing_bib)}")
+print(f"Не удалось обработать: {len(failed_files)}\n")
+df.head(15)
+```
+
+## Шаг 6. Проверка наличия текстов без библиографических разделов
+
+```python
+if missing_bib:
+    print("В этих файлах не найден заголовок библиографии:")
+    for f in missing_bib:
+        print("-", f)
+    print("\nДобавьте новые заголовки в BIB_HEADERS.")
+else:
+    print("Во всех файлах раздел библиографии найден!")
+```
+
+## Шаг 7. Построение графа
+
+```python
+G = nx.DiGraph()
+
+for _, row in df.iterrows():
+    s, t = row["Автор"], row["Кого цитировал"]
+    # Если между двумя авторами уже есть связь, то мы прибавляем к её весу + 1. 
+    if G.has_edge(s, t):
+        G[s][t]["weight"] += 1
+    else:
+        G.add_edge(s, t, weight=1)
+
+print(f"Вершин в графе: {G.number_of_nodes()}")
+print(f"Рёбер в графе: {G.number_of_edges()}")
+```
+
+## Шаг 8. Вывод самых влиятельных авторов из списка
+
+```python
+# Формируем словарь с каждым автором и его входящими связями, т.е. сколько его цитировали 
+# (причём сумма будет складываться не по кол-ву стрелок, а по их весу)
+in_deg = dict(G.in_degree(weight="weight"))
+pagerank = nx.pagerank(G)
+
+most_noticeable = pd.DataFrame({
+    "Кол-во цитирований": in_deg,
+    "Влияние": pagerank,
+}).fillna(0).sort_values("Влияние", ascending=False)
+
+print("Самые влиятельные фигуры постгуманизма:")
+most_noticeable.head(10)
+```
+
+## Шаг 9. Визуализация
+
+```python
+# Простой набор из 12 цветов, по которому мы пройдём циклически и придадим каждому автору свой
+palette = ["#ff0000", "#0000ff", "#00ff00", "#ffff00", "#524732", "#ffa500", "#800080", "#00ffff", "#ff00ff", "#92ada2", "#7fffd4", '#78f084']
+authors_list = list(G.nodes())
+node_colors = {name: palette[i % len(palette)] for i, name in enumerate(authors_list)}
+
+# Атрибуты узлов графа: цвет, размер в зависимости от кол-ва входящих связей, title при наведении курсора
+for node in G.nodes():
+    deg = in_deg.get(node)
+    G.nodes[node]["color"] = node_colors[node]
+    G.nodes[node]["size"]  = 8 + deg * 1.2
+    G.nodes[node]["title"] = (
+        f"Имя: {node}\n"
+        f"Входящих цитирований: {deg}\n"
+        f"Влияние: {pagerank[node]:.3f}"
+    )
+
+# Раскрашиваем рёбра в белый цвет
+for s, t in G.edges():
+    G.edges[s, t]["color"] = "#ffffff" 
+
+# Параметры самой сети
+net = Network(
+    height="800px",
+    width="100%",
+    bgcolor="#000000",
+    font_color="#eeeeee",
+    directed=True
+)
+
+net.from_nx(G)
+
+# Настраиваем физику; к именам узлов добавляем чёрный фон для читабельности
+net.set_options("""
+{
+  "physics": {
+    "enabled": true,
+    "barnesHut": {
+      "gravitationalConstant": -8000,
+      "centralGravity": 0.1,
+      "springLength": 200,
+      "springConstant": 0.01,
+      "damping": 0.6
+    }
+  },
+  "nodes": {
+    "font": {
+      "size": 18, "color": "#ffffff",
+      "strokeWidth": 4, "strokeColor": "#000000"
+    }
+  }
+}
+""")
+
+net.write_html("posthumanism_graph.html")
+```
